@@ -131,10 +131,13 @@ def load_tennis_data_uk(
             if cache_path and cache_path.exists():
                 df = pd.read_parquet(cache_path)
             else:
-                df = _fetch_year(tour, year)
-                if df is None:
+                raw = _fetch_year(tour, year)
+                if raw is None:
                     log.warning("No tennis-data.co.uk file found for %s %d", tour, year)
                     continue
+                # Normalise before caching so type coercions run first
+                # (raw files contain 'NR' strings in rank columns etc.)
+                df = _normalise(raw)
                 if cache_path:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
                     df.to_parquet(cache_path, index=False)
@@ -146,7 +149,7 @@ def load_tennis_data_uk(
         raise RuntimeError("No tennis-data.co.uk data loaded.")
 
     combined = pd.concat(frames, ignore_index=True)
-    combined = _normalise(combined)
+    combined = combined.sort_values("match_date").reset_index(drop=True)
     log.info("tennis-data.co.uk total: %d matches", len(combined))
     return combined
 
@@ -163,10 +166,18 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
 
-    for col in ["winner_rank", "loser_rank", "best_of",
-                "odds_b365_winner", "odds_b365_loser",
-                "odds_ps_winner", "odds_ps_loser",
-                "odds_avg_winner", "odds_avg_loser"]:
+    # Coerce all columns that should be numeric (handles 'NR', ' ', blanks, etc.)
+    _NUMERIC_COLS = [
+        "winner_rank", "loser_rank", "winner_rank_points", "loser_rank_points",
+        "best_of", "winner_sets", "loser_sets",
+        "w_s1", "w_s2", "w_s3", "w_s4", "w_s5",
+        "l_s1", "l_s2", "l_s3", "l_s4", "l_s5",
+        "odds_b365_winner", "odds_b365_loser",
+        "odds_ps_winner", "odds_ps_loser",
+        "odds_avg_winner", "odds_avg_loser",
+        "odds_max_winner", "odds_max_loser",
+    ]
+    for col in _NUMERIC_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -180,6 +191,11 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
             df["closing_odds_loser"] = df["closing_odds_loser"].fillna(df[col_l])
 
     df["implied_prob_winner"] = _no_vig_prob(df["closing_odds_winner"], df["closing_odds_loser"])
+
+    # Cast remaining object columns to string so Parquet serialisation never fails
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].astype(str).replace({"nan": None, "<NA>": None, " ": None})
+
     df = df.sort_values("match_date").reset_index(drop=True)
     return df
 
